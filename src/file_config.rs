@@ -2,6 +2,7 @@
 
 use crate::config::{NetworkConfig, NetworkPreset, SimulationConfig};
 use serde::Deserialize;
+use std::fmt;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -31,62 +32,90 @@ pub struct SimulationPartial {
     pub processing_time_ms: Option<u64>,
 }
 
+/// Overwrite each named field on `$dst` with the inner value of `$src.$field` when `Some`.
+///
+/// Declarative alternative to manually unpacking every `Option` on [`SimulationPartial`].
+macro_rules! apply_fields {
+    ($dst:expr, $src:expr, [$($field:ident),* $(,)?]) => {
+        $(
+            if let Some(v) = $src.$field {
+                $dst.$field = v;
+            }
+        )*
+    };
+}
+
 impl SimulationPartial {
     pub fn merge(self, mut base: SimulationConfig) -> SimulationConfig {
-        if let Some(v) = self.num_nodes {
-            base.num_nodes = v;
-        }
-        if let Some(v) = self.target_block_interval_ms {
-            base.target_block_interval_ms = v;
-        }
-        if let Some(v) = self.average_mining_power {
-            base.average_mining_power = v;
-        }
-        if let Some(v) = self.stdev_mining_power {
-            base.stdev_mining_power = v;
-        }
-        if let Some(v) = self.end_block_height {
-            base.end_block_height = v;
-        }
-        if let Some(v) = self.block_size_bytes {
-            base.block_size_bytes = v;
-        }
-        if let Some(v) = self.compact_block_size_bytes {
-            base.compact_block_size_bytes = v;
-        }
-        if let Some(v) = self.cbr_usage_rate {
-            base.cbr_usage_rate = v;
-        }
-        if let Some(v) = self.churn_node_rate {
-            base.churn_node_rate = v;
-        }
-        if let Some(v) = self.cbr_failure_rate_control {
-            base.cbr_failure_rate_control = v;
-        }
-        if let Some(v) = self.cbr_failure_rate_churn {
-            base.cbr_failure_rate_churn = v;
-        }
-        if let Some(v) = self.rng_seed {
-            base.rng_seed = v;
-        }
-        if let Some(v) = self.message_overhead_ms {
-            base.message_overhead_ms = v;
-        }
-        if let Some(v) = self.processing_time_ms {
-            base.processing_time_ms = v;
-        }
+        apply_fields!(
+            base,
+            self,
+            [
+                num_nodes,
+                target_block_interval_ms,
+                average_mining_power,
+                stdev_mining_power,
+                end_block_height,
+                block_size_bytes,
+                compact_block_size_bytes,
+                cbr_usage_rate,
+                churn_node_rate,
+                cbr_failure_rate_control,
+                cbr_failure_rate_churn,
+                rng_seed,
+                message_overhead_ms,
+                processing_time_ms,
+            ]
+        );
         base
     }
 }
 
+#[derive(Debug)]
+pub enum FileConfigError {
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for FileConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(f, "{path}: {source}"),
+            Self::Parse { path, source } => write!(f, "{path}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for FileConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+        }
+    }
+}
+
 impl FileConfig {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
-        toml::from_str(&raw).map_err(|e| format!("{path:?}: {e}"))
+    pub fn load(path: &Path) -> Result<Self, FileConfigError> {
+        let path_display = path.display().to_string();
+        let raw = std::fs::read_to_string(path).map_err(|source| FileConfigError::Read {
+            path: path_display.clone(),
+            source,
+        })?;
+        toml::from_str(&raw).map_err(|source| FileConfigError::Parse {
+            path: path_display,
+            source,
+        })
     }
 
     pub fn build(self, base_sim: SimulationConfig) -> (SimulationConfig, NetworkConfig) {
-        let net = self.network.to_network_config();
+        let net = NetworkConfig::from(self.network);
         let sim = self.simulation.merge(base_sim);
         (sim, net)
     }

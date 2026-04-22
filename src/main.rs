@@ -7,12 +7,14 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use simblock::{FileConfig, NetworkConfig, Simulation, SimulationConfig};
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How often to refresh the progress bar (discrete events processed).
 const PROGRESS_TICK_EVENTS: u64 = 256;
+/// Number of discrete file-export steps reported to the export progress bar.
+const EXPORT_STEPS: u64 = 4;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,7 +59,80 @@ fn default_output_run_dir() -> PathBuf {
     PathBuf::from(format!("output/run-{stamp}"))
 }
 
-fn main() -> std::io::Result<()> {
+/// Load simulation + network configuration, optionally from a TOML file, falling back to built-in defaults.
+fn load_configs(
+    path: Option<&Path>,
+    multi: &MultiProgress,
+) -> io::Result<(SimulationConfig, NetworkConfig)> {
+    match path {
+        Some(p) => {
+            let fc =
+                FileConfig::load(p).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            multi.println(format!("Loaded config {}", p.display()))?;
+            Ok(fc.build(SimulationConfig::default()))
+        }
+        None => {
+            multi.println("No config file; using built-in defaults")?;
+            Ok((SimulationConfig::default(), NetworkConfig::default()))
+        }
+    }
+}
+
+/// Paths written by [`write_all_outputs`]; only `output_json` is returned for CLI display.
+struct OutputPaths {
+    output_json: PathBuf,
+}
+
+/// Write `static.json` before running; writes are reported via `multi`'s spinner.
+fn write_static(simulation: &Simulation, out_dir: &Path, multi: &MultiProgress) -> io::Result<()> {
+    let static_path = out_dir.join("static.json");
+    let pb = multi.add(ProgressBar::new_spinner());
+    pb.set_style(spinner_line_style());
+    pb.set_message(format!("Writing {}", static_path.display()));
+    pb.enable_steady_tick(Duration::from_millis(100));
+    simulation.write_static_json(&static_path)?;
+    pb.finish_with_message(format!("Wrote {}", static_path.display()));
+    Ok(())
+}
+
+/// Write `output.json`, `graph/`, `blockList.txt`, and `propagation.csv` (post-run).
+fn write_all_outputs(
+    simulation: &Simulation,
+    out_dir: &Path,
+    multi: &MultiProgress,
+) -> io::Result<OutputPaths> {
+    let pb = multi.add(ProgressBar::new(EXPORT_STEPS));
+    pb.set_style(bar_line_style());
+    pb.set_message("Writing outputs");
+
+    let json_path = out_dir.join("output.json");
+    pb.set_message(format!("Writing {}", json_path.display()));
+    let mut w = BufWriter::new(File::create(&json_path)?);
+    simulation.write_json_events(&mut w)?;
+    w.flush()?;
+    pb.inc(1);
+
+    pb.set_message(format!("Writing {}", out_dir.join("graph").display()));
+    simulation.write_graph_dir(out_dir)?;
+    pb.inc(1);
+
+    let block_list = out_dir.join("blockList.txt");
+    pb.set_message(format!("Writing {}", block_list.display()));
+    simulation.write_block_list_txt(&block_list)?;
+    pb.inc(1);
+
+    let propagation_csv = out_dir.join("propagation.csv");
+    pb.set_message(format!("Writing {}", propagation_csv.display()));
+    simulation.write_propagation_csv(&propagation_csv)?;
+    pb.inc(1);
+
+    pb.finish_with_message(format!("Wrote all outputs under {}", out_dir.display()));
+    Ok(OutputPaths {
+        output_json: json_path,
+    })
+}
+
+fn main() -> io::Result<()> {
     let Cli {
         output_dir,
         config: config_path,
@@ -66,18 +141,9 @@ fn main() -> std::io::Result<()> {
     std::fs::create_dir_all(&out_dir)?;
 
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+    let (sim_cfg, net_cfg) = load_configs(config_path.as_deref(), &multi)?;
 
-    let (sim, net) = if let Some(ref p) = config_path {
-        let fc = FileConfig::load(p)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        multi.println(format!("Loaded config {}", p.display()))?;
-        fc.build(SimulationConfig::default())
-    } else {
-        multi.println("No config file; using built-in defaults")?;
-        (SimulationConfig::default(), NetworkConfig::default())
-    };
-
-    let mut simulation = Simulation::new(sim, net);
+    let mut simulation = Simulation::new(sim_cfg, net_cfg);
     multi.println(format!(
         "Initialized {} nodes, {} region(s), run until block height {}",
         simulation.sim.num_nodes,
@@ -85,13 +151,7 @@ fn main() -> std::io::Result<()> {
         simulation.sim.end_block_height,
     ))?;
 
-    let static_path = out_dir.join("static.json");
-    let static_pb = multi.add(ProgressBar::new_spinner());
-    static_pb.set_style(spinner_line_style());
-    static_pb.set_message(format!("Writing {}", static_path.display()));
-    static_pb.enable_steady_tick(Duration::from_millis(100));
-    simulation.write_static_json(&static_path)?;
-    static_pb.finish_with_message(format!("Wrote {}", static_path.display()));
+    write_static(&simulation, &out_dir, &multi)?;
 
     let end_h = simulation.sim.end_block_height.max(1);
     let sim_pb = multi.add(ProgressBar::new(end_h as u64));
@@ -105,33 +165,7 @@ fn main() -> std::io::Result<()> {
         stats.final_time_ms, stats.blocks, stats.events_logged
     ));
 
-    const EXPORT_STEPS: u64 = 4;
-    let export_pb = multi.add(ProgressBar::new(EXPORT_STEPS));
-    export_pb.set_style(bar_line_style());
-    export_pb.set_message("Writing outputs");
-
-    let json_path = out_dir.join("output.json");
-    export_pb.set_message(format!("Writing {}", json_path.display()));
-    let mut w = BufWriter::new(File::create(&json_path)?);
-    simulation.write_json_events(&mut w)?;
-    w.flush()?;
-    export_pb.inc(1);
-
-    export_pb.set_message(format!("Writing {}", out_dir.join("graph").display()));
-    simulation.write_graph_dir(&out_dir)?;
-    export_pb.inc(1);
-
-    let block_list = out_dir.join("blockList.txt");
-    export_pb.set_message(format!("Writing {}", block_list.display()));
-    simulation.write_block_list_txt(&block_list)?;
-    export_pb.inc(1);
-
-    let propagation_csv = out_dir.join("propagation.csv");
-    export_pb.set_message(format!("Writing {}", propagation_csv.display()));
-    simulation.write_propagation_csv(&propagation_csv)?;
-    export_pb.inc(1);
-
-    export_pb.finish_with_message(format!("Wrote all outputs under {}", out_dir.display()));
+    let OutputPaths { output_json } = write_all_outputs(&simulation, &out_dir, &multi)?;
 
     let config_note = config_path
         .as_ref()
@@ -142,7 +176,7 @@ fn main() -> std::io::Result<()> {
         stats.blocks,
         stats.final_time_ms,
         stats.events_logged,
-        json_path.display(),
+        output_json.display(),
         config_note
     ))?;
 

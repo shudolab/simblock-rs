@@ -192,14 +192,22 @@ pub enum NetworkPreset {
     Dogecoin,
 }
 
-impl NetworkPreset {
-    pub fn to_network_config(self) -> NetworkConfig {
-        match self {
-            NetworkPreset::Bitcoin2019 => NetworkConfig::bitcoin_2019(),
-            NetworkPreset::Bitcoin2015 => NetworkConfig::bitcoin_2015(),
-            NetworkPreset::Litecoin => NetworkConfig::litecoin(),
-            NetworkPreset::Dogecoin => NetworkConfig::dogecoin(),
+impl From<NetworkPreset> for NetworkConfig {
+    fn from(preset: NetworkPreset) -> Self {
+        match preset {
+            NetworkPreset::Bitcoin2019 => Self::bitcoin_2019(),
+            NetworkPreset::Bitcoin2015 => Self::bitcoin_2015(),
+            NetworkPreset::Litecoin => Self::litecoin(),
+            NetworkPreset::Dogecoin => Self::dogecoin(),
         }
+    }
+}
+
+impl NetworkPreset {
+    /// Kept as a thin alias over [`From`]; prefer `NetworkConfig::from(preset)` in new code.
+    #[inline]
+    pub fn to_network_config(self) -> NetworkConfig {
+        self.into()
     }
 }
 
