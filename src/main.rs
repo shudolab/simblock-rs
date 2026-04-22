@@ -15,7 +15,11 @@ use std::time::Duration;
 const PROGRESS_TICK_EVENTS: u64 = 256;
 
 #[derive(Parser, Debug)]
-#[command(name = "simblock", version, about = "Discrete-event blockchain P2P network simulator")]
+#[command(
+    name = "simblock",
+    version,
+    about = "Discrete-event blockchain P2P network simulator"
+)]
 struct Cli {
     /// Directory to write output files (output.json, static.json, graph/, etc.).
     /// If omitted, uses `output/run-<YYYYMMDD_HHMMSS>/` (local time).
@@ -127,10 +131,7 @@ fn main() -> std::io::Result<()> {
     simulation.write_propagation_csv(&propagation_csv)?;
     export_pb.inc(1);
 
-    export_pb.finish_with_message(format!(
-        "Wrote all outputs under {}",
-        out_dir.display()
-    ));
+    export_pb.finish_with_message(format!("Wrote all outputs under {}", out_dir.display()));
 
     let config_note = config_path
         .as_ref()

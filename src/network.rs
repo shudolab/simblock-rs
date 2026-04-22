@@ -9,10 +9,6 @@ use rand::Rng;
 const LATENCY_SHAPE_FACTOR: f64 = 0.2;
 /// Subtracted from the regional mean to form the `scale` term (`mean - scale_offset`).
 const LATENCY_SCALE_OFFSET_MS: f64 = 5.0;
-/// Clamp `Uniform(0,1)` samples away from 0 and 1 before `powf`.
-const LATENCY_UNIFORM_CLAMP_EPS: f64 = 1e-12;
-/// Minimum returned latency (ms); matches discrete-event safety used after sampling.
-const LATENCY_MIN_MS: u64 = 1;
 
 // --- Block transfer (`bits / (bps / divisor) + processing`) -----------------
 
@@ -22,7 +18,8 @@ const BANDWIDTH_BPS_PER_MS_UNIT: u64 = 1000;
 const BANDWIDTH_MIN_BPS: u64 = 1;
 const BANDWIDTH_MIN_BITS_PER_MS: u64 = 1;
 
-/// Random latency sample from a heavy-tailed transform of the regional mean.
+/// Random latency sample: `round(scale / u^(1/shape))` with `shape = 0.2 * mean`, `scale = mean - 5`, `u ~ Uniform(0,1)`.
+/// Non-finite positive results map to a large finite value.
 pub fn sample_latency_ms<R: Rng + ?Sized>(
     rng: &mut R,
     net: &NetworkConfig,
@@ -31,18 +28,20 @@ pub fn sample_latency_ms<R: Rng + ?Sized>(
 ) -> u64 {
     let mean = net.topology.latency_ms[from][to] as f64;
     if mean <= 0.0 {
-        return LATENCY_MIN_MS;
+        return 0;
     }
     let shape = LATENCY_SHAPE_FACTOR * mean;
     let scale = mean - LATENCY_SCALE_OFFSET_MS;
     if scale <= 0.0 {
-        return (mean.round() as u64).max(LATENCY_MIN_MS);
+        return mean.round().max(0.0) as u64;
     }
-    let u = rng
-        .gen::<f64>()
-        .clamp(LATENCY_UNIFORM_CLAMP_EPS, 1.0 - LATENCY_UNIFORM_CLAMP_EPS);
-    let v = (scale / u.powf(1.0 / shape)).round();
-    v.max(LATENCY_MIN_MS as f64) as u64
+    let u = rng.gen::<f64>();
+    let v = scale / u.powf(1.0 / shape);
+    let rounded = v.round();
+    if !rounded.is_finite() || rounded <= 0.0 {
+        return u64::MAX / 4;
+    }
+    rounded.min(u64::MAX as f64) as u64
 }
 
 pub fn bandwidth_bps(net: &NetworkConfig, from: usize, to: usize) -> u64 {
@@ -116,18 +115,17 @@ mod tests {
     }
 
     #[test]
-    fn sample_latency_ms_positive_with_seeded_rng() {
+    fn sample_latency_ms_finite_with_seeded_rng() {
         let net = test_net();
         let mut rng = StdRng::seed_from_u64(99);
         for _ in 0..20 {
             let ms = sample_latency_ms(&mut rng, &net, 0, 1);
-            assert!(ms >= 1);
+            assert!(ms < u64::MAX / 8);
         }
     }
 
-    /// Mean below `LATENCY_SCALE_OFFSET_MS` yields non-positive `scale`; result must stay ≥ 1 ms.
     #[test]
-    fn sample_latency_ms_at_least_one_when_mean_below_five() {
+    fn sample_latency_ms_fallback_when_mean_below_five() {
         const REGIONS: &[RegionSpec] = &[RegionSpec {
             name: "A",
             download_bps: 10_000_000,
@@ -148,7 +146,7 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(42);
         for _ in 0..10 {
-            assert!(sample_latency_ms(&mut rng, &net, 0, 0) >= 1);
+            assert_eq!(sample_latency_ms(&mut rng, &net, 0, 0), 3);
         }
     }
 }

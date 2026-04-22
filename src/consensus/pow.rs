@@ -13,18 +13,27 @@ fn difficulty_as_f64(d: &BigUint) -> f64 {
     d.to_string().parse().unwrap_or(f64::MAX)
 }
 
-/// Exponentially distributed mining delay in milliseconds.
+/// Mining delay in milliseconds from exponential work model: `-ln(1-u) * difficulty / mining_power`,
+/// truncated toward zero (`u ~ Uniform(0,1)`).
 pub fn sample_mining_delay_ms<R: Rng + ?Sized>(
     rng: &mut R,
     difficulty: &BigUint,
     mining_power: u64,
 ) -> u64 {
-    let u = rng.gen::<f64>().clamp(1e-15, 1.0 - 1e-15);
-    let exp = -(1.0 - u).ln();
+    let mut u = rng.gen::<f64>();
+    if u >= 1.0 {
+        u = 1.0 - f64::EPSILON;
+    }
     let d = difficulty_as_f64(difficulty);
-    let p = mining_power.max(1) as f64;
-    let ms = exp * d / p;
-    ms.max(1.0).round() as u64
+    let p = mining_power as f64;
+    if p <= 0.0 {
+        return 0;
+    }
+    let ms = -(1.0 - u).ln() * d / p;
+    if !ms.is_finite() || ms <= 0.0 {
+        return 0;
+    }
+    ms.trunc() as u64
 }
 
 /// Whether `received` is a valid heavier extension than `current_tip`.

@@ -16,12 +16,15 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, Normal};
 use std::cmp::{Ordering, Reverse};
-use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+
+/// Maximum number of blocks kept for propagation export; oldest is evicted when exceeded.
+const OBSERVED_PROPAGATION_BLOCK_LIMIT: usize = 10;
 
 /// Queued outbound block response after rec or `getblocktxn` (per-peer send queue).
 #[derive(Debug, Clone)]
@@ -86,9 +89,11 @@ pub struct Simulation {
     store: BlockStore,
     nodes: Vec<NodeState>,
     propagation: HashMap<BlockId, HashMap<NodeId, u64>>,
-    /// Blocks in order of first propagation delay observation (any node).
-    propagation_block_order: Vec<BlockId>,
-    /// Per block, nodes in order of first observed delay for that block.
+    /// Blocks tracked for propagation export, in observation order (FIFO cap).
+    propagation_observed_blocks: Vec<BlockId>,
+    /// Set mirror of [`Self::propagation_observed_blocks`] for O(1) lookup.
+    propagation_observed_set: HashSet<BlockId>,
+    /// Per block, node ids in first-seen order (updates do not reorder keys).
     propagation_node_order: HashMap<BlockId, Vec<NodeId>>,
     log: EventLog,
     finished: bool,
@@ -166,7 +171,8 @@ impl Simulation {
             store: BlockStore::default(),
             nodes,
             propagation: HashMap::new(),
-            propagation_block_order: Vec::new(),
+            propagation_observed_blocks: Vec::new(),
+            propagation_observed_set: HashSet::new(),
             propagation_node_order: HashMap::new(),
             log,
             finished: false,
@@ -245,21 +251,38 @@ impl Simulation {
     }
 
     fn record_propagation(&mut self, block: BlockId, node: NodeId, delay: u64) {
-        let per_block = self.propagation.entry(block).or_default();
-        let first_for_block = per_block.is_empty();
-        match per_block.entry(node) {
-            Entry::Vacant(e) => {
-                e.insert(delay);
+        if self.propagation_observed_set.contains(&block) {
+            let delays = self.propagation.entry(block).or_default();
+            if let Some(d) = delays.get_mut(&node) {
+                *d = delay;
+            } else {
+                delays.insert(node, delay);
                 self.propagation_node_order
                     .entry(block)
                     .or_default()
                     .push(node);
-                if first_for_block {
-                    self.propagation_block_order.push(block);
-                }
             }
-            Entry::Occupied(_) => {}
+            return;
         }
+
+        if self.propagation_observed_blocks.len() > OBSERVED_PROPAGATION_BLOCK_LIMIT {
+            self.evict_oldest_propagation_block();
+        }
+        self.propagation_observed_blocks.push(block);
+        self.propagation_observed_set.insert(block);
+        self.propagation
+            .insert(block, HashMap::from([(node, delay)]));
+        self.propagation_node_order.insert(block, vec![node]);
+    }
+
+    fn evict_oldest_propagation_block(&mut self) {
+        let Some(evicted) = self.propagation_observed_blocks.first().copied() else {
+            return;
+        };
+        self.propagation_observed_blocks.remove(0);
+        self.propagation_observed_set.remove(&evicted);
+        self.propagation.remove(&evicted);
+        self.propagation_node_order.remove(&evicted);
     }
 
     /// Runs the discrete-event loop until the queue is empty.
@@ -273,7 +296,11 @@ impl Simulation {
 
     /// Same as [`Self::run`], but invokes `on_step` every `every` processed events (and once at the
     /// end) when `every > 0`. Use for CLI progress (`every == 0` skips callbacks).
-    pub fn run_observer(&mut self, every: u64, mut on_step: impl FnMut(u64, &Simulation)) -> RunStats {
+    pub fn run_observer(
+        &mut self,
+        every: u64,
+        mut on_step: impl FnMut(u64, &Simulation),
+    ) -> RunStats {
         let mut i = 0u64;
         while let Some(te) = self.queue.pop() {
             let t = te.key.0 .0;
@@ -302,7 +329,7 @@ impl Simulation {
                 } => self.on_block_payload_arrive(recipient, sender, block, depart_ms, kind),
             }
             i += 1;
-            if every > 0 && i % every == 0 {
+            if every > 0 && i.is_multiple_of(every) {
                 on_step(i, self);
             }
         }
@@ -366,7 +393,7 @@ impl Simulation {
     /// Prints propagation matrices to `w`: one block as `block_id:height`, then lines
     /// `node_id,delay_ms`, then a blank line.
     pub fn write_propagation_human(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        for &block in &self.propagation_block_order {
+        for &block in &self.propagation_observed_blocks {
             let Some(rec) = self.store.get(block) else {
                 continue;
             };
@@ -393,7 +420,7 @@ impl Simulation {
     pub fn write_propagation_csv(&self, path: &Path) -> std::io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         writeln!(w, "block_id,height,node_id,delay_ms")?;
-        for &block in &self.propagation_block_order {
+        for &block in &self.propagation_observed_blocks {
             let Some(rec) = self.store.get(block) else {
                 continue;
             };
@@ -871,10 +898,8 @@ fn pick_genesis_minter<R: Rng + ?Sized>(rng: &mut R, nodes: &[NodeState]) -> Nod
 }
 
 fn sample_mining_power<R: Rng + ?Sized>(rng: &mut R, mean: u64, stdev: u64) -> u64 {
-    let u1 = rng.gen::<f64>().clamp(1e-9, 1.0 - 1e-9);
-    let u2 = rng.gen::<f64>();
-    let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
-    let v = (mean as f64 + z * stdev as f64).round() as i64;
+    let n = Normal::new(mean as f64, stdev as f64).expect("mining power mean/stdev");
+    let v = n.sample(rng).round() as i64;
     v.max(1) as u64
 }
 
@@ -1042,6 +1067,40 @@ mod tests {
         assert!(h.contains(":0\n") || h.contains(":1\n")); // height line
         assert!(h.contains(',')); // node,delay
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn propagation_csv_respects_observed_block_cap() {
+        let cfg = SimulationConfig {
+            end_block_height: 40,
+            ..Default::default()
+        };
+        let mut s = Simulation::new(cfg, NetworkConfig::default());
+        s.run();
+        let dir = std::env::temp_dir().join(format!(
+            "simblock-rs-prop-observed-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        s.write_propagation_csv(&dir.join("propagation.csv"))
+            .unwrap();
+        let csv = std::fs::read_to_string(dir.join("propagation.csv")).unwrap();
+        let mut block_ids = HashSet::new();
+        for line in csv.lines().skip(1) {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(id) = line.split(',').next() {
+                block_ids.insert(id.to_string());
+            }
+        }
+        assert!(
+            block_ids.len() <= 11,
+            "at most 11 distinct blocks in propagation export; got {}",
+            block_ids.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
