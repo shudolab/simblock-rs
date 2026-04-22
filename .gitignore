@@ -1,0 +1,11 @@
+/target
+
+.vscode/
+.claude/
+.cursor/
+
+output/
+
+docs/
+
+.DS_Store

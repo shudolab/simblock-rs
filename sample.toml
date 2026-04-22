@@ -1,0 +1,20 @@
+# TOML settings for: cargo run --release -- OUTPUT_DIR --config sample.toml
+# Keys and defaults: README.md, section "TOML configuration (`--config`)".
+
+network = "bitcoin2019"
+
+[simulation]
+num_nodes = 300
+target_block_interval_ms = 600000
+average_mining_power = 400000
+stdev_mining_power = 100000
+end_block_height = 100
+block_size_bytes = 535000
+compact_block_size_bytes = 18000
+cbr_usage_rate = 0.964
+churn_node_rate = 0.976
+cbr_failure_rate_control = 0.13
+cbr_failure_rate_churn = 0.27
+rng_seed = 10
+message_overhead_ms = 10
+processing_time_ms = 2
