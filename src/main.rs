@@ -126,7 +126,8 @@ fn write_all_outputs(
     simulation.write_propagation_csv(&propagation_csv)?;
     pb.inc(1);
 
-    pb.finish_with_message(format!("Wrote all outputs under {}", out_dir.display()));
+    pb.finish_and_clear();
+    multi.println(format!("Wrote all outputs under {}", out_dir.display()))?;
     Ok(OutputPaths {
         output_json: json_path,
     })
